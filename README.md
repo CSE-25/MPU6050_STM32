@@ -4,6 +4,7 @@ A FreeRTOS Embedded System based on STM32F407G Microcontroller to Detect and Dis
 ## Legend
 
 <div align="center">
+<h3> (Description) LED Color based indication</h3>
 
 | Image | Key |
 | --- | --- |
