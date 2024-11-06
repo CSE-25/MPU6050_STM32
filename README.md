@@ -1,5 +1,5 @@
 # MPU6050_STM32
-A FreeRTOS Embedded System based on STM32F407G Microcontroller to Detect and Display Rotation from MPU6050 Accelerometer.
+A FreeRTOS Embedded System based on STM32F407G-Discovery1 Microcontroller to Detect and Display Rotation from MPU6050 Accelerometer.
 
 ## Legend
 

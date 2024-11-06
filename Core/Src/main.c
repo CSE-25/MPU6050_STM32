@@ -1,127 +1,99 @@
 #include "main.h"
 #include "stm32f4xx_hal.h"
-#include "stdio.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h"
+#include "stdio.h"
+#include "fonts.h"
+#include "ssd1306.h"
 
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void I2C_Config(void);
-uint8_t MPU6050_Init(void);
-void MPU6050_Read_Accel(float* ax, float* ay, float* az);
-void UpdateLEDs(float x, float y, float z);
 
-static void task_mpu6050_read(void* parameters);
-static void task_led_update(void* parameters);
-
-#define MPU6050_ADDR 0xD0
-#define ACCEL_XOUT_H 0x3B
 
 I2C_HandleTypeDef hi2c1;
+I2C_HandleTypeDef hi2c2;
+
+
+//MPU6050 I2C Address and Register Definitions
+#define MPU6050_ADDR 0xD0
+#define ACCEL_XOUT_H 0x3B
+ //#define SSD1306_I2C_ADDR 0x3C
+#define HIGHEST_TASK_PRIORITY      3    // Highest priority
+#define LED_HIGH_PRIORITY      2    // Medium priority
+#define LED_LOW_PRIORITY       1    // Lowest priority
+
+#define MUTEX_CEILING_PRIORITY HIGHEST_TASK_PRIORITY  // Priority ceiling
+
 
 // Shared variables for accelerometer data
 float ax = 0, ay = 0, az = 0;
 
-int main(void)
-{
-    HAL_Init();
-    SystemClock_Config();
-    MX_GPIO_Init();
-    I2C_Config();
+// Priority Ceiling Protocol Mutex for MPU6050 access
+SemaphoreHandle_t xMPU6050Semaphore;
 
-    // Initialize all LEDs to ON state to verify they're working
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_SET);
-    HAL_Delay(1000);  // Keep them on for 1 second
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_RESET);
-
-    // Initialize MPU6050
-    if (MPU6050_Init() != HAL_OK) {
-        // If initialization fails, blink red LED rapidly
-        while (1) {
-            HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_14);
-            HAL_Delay(100);
-        }
-    }
-
-    // Create tasks
-    xTaskCreate(task_mpu6050_read, "MPU6050 Read", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
-    xTaskCreate(task_led_update, "LED Update", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
-
-    // Start the scheduler
-    vTaskStartScheduler();
-
-    // We should never get here as control is now taken by the scheduler
-    while (1)
-    {
+static UBaseType_t task_original_priority;
+static UBaseType_t led_high_task_original_priority;
+static UBaseType_t led_low_task_original_priority;
+// Function prototypes
+static void task_oled_update(void* parameters);
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void I2C1_Config(void);
+static void I2C2_Config(void);
+uint8_t MPU6050_Init(void);
+void MPU6050_Read_Accel(float* ax, float* ay, float* az);
+void UpdateLEDs(float x, float y, float z);
+static void task_mpu6050_read(void* parameters);
+static void task_led_update(void* parameters);
+void raise_priority_to_ceiling(TaskHandle_t task_handle);
+void restore_task_priority(TaskHandle_t task_handle, UBaseType_t original_priority);
 
 
-
-    }
-}
-uint8_t MPU6050_Init(void)
-{
+//MPU6050 initialization function
+uint8_t MPU6050_Init(void) {
     uint8_t check;
     uint8_t Data;
 
     // Check device ID
-    HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x75, 1, &check, 1, 1000);
-
-    if (check == 0x68)  // 0x68 will be returned by the sensor if everything goes well
-    {
-        // Power management register 0X6B we should write all 0's to wake the sensor up
+    HAL_I2C_Mem_Read(&hi2c2, MPU6050_ADDR, 0x75, 1, &check, 1, 1000);
+    if (check == 0x68) {
+        // Power up the sensor
         Data = 0;
-        HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x6B, 1, &Data, 1, 1000);
+        HAL_I2C_Mem_Write(&hi2c2, MPU6050_ADDR, 0x6B, 1, &Data, 1, 1000);
 
-        // Set DATA RATE of 1KHz by writing SMPLRT_DIV register
+        // Set sample rate
         Data = 0x07;
-        HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x19, 1, &Data, 1, 1000);
+        HAL_I2C_Mem_Write(&hi2c2, MPU6050_ADDR, 0x19, 1, &Data, 1, 1000);
 
-        // Set accelerometer configuration in ACCEL_CONFIG Register
-        // XA_ST=0,YA_ST=0,ZA_ST=0, FS_SEL=0 -> ± 2g
+        // Configure accelerometer
         Data = 0x00;
-        HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x1C, 1, &Data, 1, 1000);
+        HAL_I2C_Mem_Write(&hi2c2, MPU6050_ADDR, 0x1C, 1, &Data, 1, 1000);
 
         return HAL_OK;
     }
     return HAL_ERROR;
 }
 
-void MPU6050_Read_Accel(float* ax, float* ay, float* az)
-
-
-{
+// MPU6050 accelerometer read function
+void MPU6050_Read_Accel(float* ax, float* ay, float* az) {
     uint8_t Rec_Data[6];
     int16_t Accel_X_RAW, Accel_Y_RAW, Accel_Z_RAW;
 
-
-
-    HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, ACCEL_XOUT_H, 1, Rec_Data, 6, 1000);
-
+    HAL_I2C_Mem_Read(&hi2c2, MPU6050_ADDR, ACCEL_XOUT_H, 1, Rec_Data, 6, 1000);
     Accel_X_RAW = (int16_t)(Rec_Data[0] << 8 | Rec_Data[1]);
     Accel_Y_RAW = (int16_t)(Rec_Data[2] << 8 | Rec_Data[3]);
     Accel_Z_RAW = (int16_t)(Rec_Data[4] << 8 | Rec_Data[5]);
-
 
     *ax = Accel_X_RAW / 16384.0;
     *ay = Accel_Y_RAW / 16384.0;
     *az = Accel_Z_RAW / 16384.0;
 }
 
-void UpdateLEDs(float x, float y, float z)
 
 
-
-
-{
-    const float threshold = 0.3;  // Lowered the threshold for easier triggering
-
-
+// LED update function
+void UpdateLEDs(float x, float y, float z) {
+    const float threshold = 0.3;
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_RESET);
-
-
-
-
-
 
     if (x > threshold || x < -threshold) {
         HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET);  // Green LED for X-axis
@@ -135,42 +107,134 @@ void UpdateLEDs(float x, float y, float z)
         HAL_GPIO_WritePin(GPIOD, GPIO_PIN_15, GPIO_PIN_SET);  // Blue LED for negative Z-axis
     }
 }
-static void task_mpu6050_read(void* parameters)
-{
-    while (1)
 
-
-
-
-
-
-    {
-        MPU6050_Read_Accel(&ax, &ay, &az);
-        vTaskDelay(pdMS_TO_TICKS(50));  // 50ms delay
-
-
-
-
-
-
-
-
-
-
-
-
-    }
-
-}
-
-static void task_led_update(void* parameters)
-{
-    while (1)
-    {
-        UpdateLEDs(ax, ay, az);
-        vTaskDelay(pdMS_TO_TICKS(50));  // 50ms delay
+// Task to read accelerometer data
+static void task_mpu6050_read(void* parameters) {
+    while (1) {
+    	TaskHandle_t current_task_handle = xTaskGetCurrentTaskHandle();
+        if (xSemaphoreTake(xMPU6050Semaphore, portMAX_DELAY) == pdTRUE) {
+        	raise_priority_to_ceiling(current_task_handle);
+            MPU6050_Read_Accel(&ax, &ay, &az);
+            xSemaphoreGive(xMPU6050Semaphore);
+            restore_task_priority(current_task_handle, task_original_priority);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
+
+// Task to update LEDs based on accelerometer data
+static void task_led_update(void* parameters) {
+    while (1) {
+    	TaskHandle_t current_task_handle = xTaskGetCurrentTaskHandle();
+    	if (xSemaphoreTake(xMPU6050Semaphore, portMAX_DELAY) == pdTRUE) {
+    		raise_priority_to_ceiling(current_task_handle);
+
+        	UpdateLEDs(ax, ay, az);
+        	xSemaphoreGive(xMPU6050Semaphore);
+        	restore_task_priority(current_task_handle, task_original_priority);
+
+    	}
+    	vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void task_oled_update(void* parameters) {
+    char taskName[configMAX_TASK_NAME_LEN]; // Buffer to hold the task name
+
+    while (1) {
+        TaskHandle_t current_task_handle = xTaskGetCurrentTaskHandle();
+
+        // Retrieve the name of the currently running task
+        snprintf(taskName, configMAX_TASK_NAME_LEN, "%s", pcTaskGetName(current_task_handle));
+
+        if (xSemaphoreTake(xMPU6050Semaphore, portMAX_DELAY) == pdTRUE) {
+            //Raise task priority to ceiling level
+            raise_priority_to_ceiling(current_task_handle);
+
+            // Display "Current Task:" on the OLED
+            SSD1306_GotoXY(0, 0);
+            SSD1306_Puts("Current Task:", &Font_11x18, 1);
+
+            // Display the current task name on the OLED
+            SSD1306_GotoXY(0, 30);
+            SSD1306_Puts(taskName, &Font_16x26, 1);
+
+            // Update the screen to show the changes
+            SSD1306_UpdateScreen();
+
+            // Release the semaphore and restore the original task priority
+            xSemaphoreGive(xMPU6050Semaphore);
+            restore_task_priority(current_task_handle, task_original_priority);
+        }
+
+        HAL_Delay(50); // Delay to avoid frequent OLED updates
+    }
+}
+
+
+
+void raise_priority_to_ceiling(TaskHandle_t task_handle)
+{
+    vTaskPrioritySet(task_handle, MUTEX_CEILING_PRIORITY);
+}
+
+/* Restore task priority after mutex release */
+void restore_task_priority(TaskHandle_t task_handle, UBaseType_t original_priority)
+{
+    vTaskPrioritySet(task_handle, original_priority);
+}
+
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    I2C1_Config();
+    I2C2_Config();
+    SSD1306_Init();
+
+    // Initialize MPU6050
+    if (MPU6050_Init() != HAL_OK) {
+        // Blink red LED rapidly if MPU6050 initialization fails
+        while (1) {
+            HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_14);
+            HAL_Delay(100);
+        }
+    }
+
+    // Create mutex for MPU6050 access
+    xMPU6050Semaphore = xSemaphoreCreateMutex();
+    //xMPU6050Semaphore = xSemaphoreCreateCounting(5, 5);
+    TaskHandle_t xTask1Handle, xTask2Handle, xTask3Handle;
+    task_original_priority = HIGHEST_TASK_PRIORITY;
+    led_high_task_original_priority = LED_HIGH_PRIORITY;
+    led_low_task_original_priority = LED_LOW_PRIORITY;
+
+
+    // Task creation
+    xTaskCreate(task_mpu6050_read, "MPU6050_Read", configMINIMAL_STACK_SIZE, NULL, HIGHEST_TASK_PRIORITY, &xTask1Handle);
+
+    xTaskCreate(task_led_update, "LED_Update", configMINIMAL_STACK_SIZE, NULL, LED_HIGH_PRIORITY, &xTask2Handle);
+
+
+    xTaskCreate(task_oled_update, "OLED Update", configMINIMAL_STACK_SIZE, NULL, LED_LOW_PRIORITY, &xTask3Handle);
+    vTaskSetDeadline(xTask1Handle, 500);
+    vTaskSetDeadline(xTask2Handle, 500);
+    vTaskSetDeadline(xTask3Handle, 500);
+
+
+
+
+
+    //Start scheduler
+    vTaskStartScheduler();
+
+
+
+
+    // Main loop (should never reach here)
+    while (1) {}
+}
+
 
 
 void SystemClock_Config(void)
@@ -237,9 +301,10 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 }
 
-static void I2C_Config(void)
+static void I2C1_Config(void)
 {
     __HAL_RCC_I2C1_CLK_ENABLE();
+    __HAL_RCC_I2C2_CLK_ENABLE();
 
     hi2c1.Instance = I2C1;
     hi2c1.Init.ClockSpeed = 100000;
@@ -255,6 +320,25 @@ static void I2C_Config(void)
     {
         Error_Handler();
     }
+
+
+}
+static void I2C2_Config(void){
+	hi2c2.Instance = I2C2;
+	hi2c2.Init.ClockSpeed = 100000;
+	hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
+	hi2c2.Init.OwnAddress1 = 0;
+	hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+	hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+	hi2c2.Init.OwnAddress2 = 0;
+	hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+	hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+
+	if (HAL_I2C_Init(&hi2c2) != HAL_OK)
+	{
+		Error_Handler();
+	}
+
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
